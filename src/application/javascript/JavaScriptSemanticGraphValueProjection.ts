@@ -1,0 +1,157 @@
+import {
+  semanticContainer,
+  semanticPropertyPointer,
+  type JavaScriptSemanticSlot,
+} from "../../domain/javascript/javascriptSemanticSlots.js";
+import type {
+  JavaScriptSemanticBinding,
+  JavaScriptSemanticValue,
+} from "../../domain/javascript/javascriptSemanticIr.js";
+import { createJavaScriptSemanticGraphUnknown } from "../../domain/javascript/javascriptSemanticGraph.js";
+import {
+  retainSemanticGraphNode,
+  addSemanticGraphRelation,
+  addSemanticGraphUnknown,
+} from "./JavaScriptSemanticGraphConstruction.js";
+import type { SemanticFlowProjectionContext } from "./JavaScriptSemanticGraphFlowProjection.js";
+import { observedSemanticEvidence } from "./JavaScriptSemanticGraphEvidence.js";
+
+/** Project bounded literal values and object slots for exact query seeds. */
+export const projectSemanticValues = (
+  context: SemanticFlowProjectionContext,
+): void => {
+  for (const binding of context.ir.bindings) {
+    const bindingNode = context.bindingNodes.get(binding.bindingId);
+    if (bindingNode === undefined) continue;
+    projectValue({
+      context,
+      binding,
+      value: binding.value,
+      target: bindingNode,
+      path: [],
+    });
+  }
+};
+
+interface ValueProjectionInput {
+  readonly context: SemanticFlowProjectionContext;
+  readonly binding: JavaScriptSemanticBinding;
+  readonly value: JavaScriptSemanticValue;
+  readonly target: ReturnType<typeof semanticPropertySlot>;
+  readonly path: readonly string[];
+}
+
+const projectValue = (input: ValueProjectionInput): void => {
+  const { context, binding, value, target, path } = input;
+  const role =
+    path.length === 0 ? "binding" : `property:${semanticPropertyPointer(path)}`;
+  if (target === null) return;
+  if (value.status === "literal") {
+    const literal = addLiteralNode(context, binding, value.value, role);
+    addSemanticGraphRelation(context.state, {
+      source: literal,
+      target,
+      relation: "defines",
+      resolution: "resolved",
+    });
+  } else if (value.status === "union")
+    for (const primitive of value.values) {
+      const literal = addLiteralNode(context, binding, primitive, role);
+      addSemanticGraphRelation(context.state, {
+        source: literal,
+        target,
+        relation: "defines",
+        resolution: "candidate",
+      });
+    }
+  else if (value.status === "object" || value.status === "array") {
+    const container = semanticContainer(value);
+    for (const property of container.slots) {
+      const propertyPath = [...path, property.name];
+      const slot = semanticPropertySlot(
+        context,
+        binding.bindingId,
+        propertyPath,
+        property,
+      );
+      if (property.presence === "absent") continue;
+      addSemanticGraphRelation(context.state, {
+        source: target,
+        target: slot,
+        relation: "writes-property",
+        resolution: property.presence === "present" ? "resolved" : "candidate",
+      });
+      if (property.presence === "present")
+        projectValue({
+          context,
+          binding,
+          value: property.value,
+          target: slot,
+          path: propertyPath,
+        });
+    }
+  } else if (value.status === "unknown" && value.resourceLimit !== undefined) {
+    const location = binding.definitions[0]?.location ?? null;
+    const evidence = observedSemanticEvidence(context.file, location);
+    const isPropertyValue = role.startsWith("property:");
+    addSemanticGraphUnknown(
+      context.state,
+      createJavaScriptSemanticGraphUnknown({
+        node_id: target.node_id,
+        family: isPropertyValue ? "object-flow" : "data-flow",
+        relation_kinds: [isPropertyValue ? "writes-property" : "defines"],
+        reason: "resource-limit",
+        detail: `${value.reason} Unknown value at ${role}.`,
+        candidate_node_ids: [target.node_id],
+        evidence: {
+          ...evidence,
+          authority: "unknown",
+          state: "unknown",
+          confidence: "unknown",
+          limitations: [value.reason],
+        },
+      }),
+    );
+  }
+};
+
+const addLiteralNode = (
+  context: SemanticFlowProjectionContext,
+  binding: JavaScriptSemanticBinding,
+  value: string | number | boolean | null,
+  role: string,
+) =>
+  retainSemanticGraphNode(context.state, context.file, {
+    kind: "literal",
+    roleKey: `literal:${binding.bindingId}:${role}:${JSON.stringify(value)}`,
+    location: binding.definitions[0]?.location ?? null,
+    label: JSON.stringify(value),
+    functionNodeId:
+      context.bindingNodes.get(binding.bindingId)?.function_node_id ?? null,
+    properties: { value },
+  });
+
+/** Create one canonical slot for a root binding and exact static property path. */
+export const semanticPropertySlot = (
+  context: SemanticFlowProjectionContext,
+  objectBindingId: string,
+  path: readonly string[],
+  fact: JavaScriptSemanticSlot,
+) =>
+  retainSemanticGraphNode(context.state, context.file, {
+    kind: "property-slot",
+    roleKey: `property:${JSON.stringify([objectBindingId, path])}`,
+    location: null,
+    label: fact.name,
+    functionNodeId:
+      context.bindingNodes.get(objectBindingId)?.function_node_id ?? null,
+    properties: {
+      name: fact.name,
+      property_path: [...path],
+      property_pointer: semanticPropertyPointer(path),
+      object_binding_id: objectBindingId,
+      presence: fact.presence,
+      value_status: fact.value.status,
+      value_coverage: semanticContainer(fact.value)?.coverage ?? null,
+    },
+  });
